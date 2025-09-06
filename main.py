@@ -461,9 +461,54 @@ async def webhooks_voice(turn: VoiceTurn):
             }
 
         sp = s.get("salesperson") or {}
-        v = s.get("vehicle") or {}
+        v  = s.get("vehicle") or {}
         slot = s.get("chosen") or ""
         title = f"Showroom Appointment — {vehicle_blurb(v)}"
         desc = (
             f"Customer: {s.get('email')} / {s.get('phone')}\n"
-            f"Salesperson: {sp.get('name')} <{sp
+            f"Salesperson: {sp.get('name','')} <{sp.get('email','')}>\n"
+            f"Vehicle: {json.dumps(v, ensure_ascii=False)}\n"
+            f"Booked via {DEALERSHIP_NAME} AI receptionist."
+        )
+
+        link = create_calendar_event(
+            sp,
+            s.get("email"),
+            s.get("phone"),
+            slot,
+            title,
+            desc
+        )
+
+        msg = f"{DEALERSHIP_NAME}: Confirmed {slot} with {sp.get('name','our advisor')} — {vehicle_blurb(v)}."
+        send_sms(s.get("phone"), msg)
+        send_email(
+            s.get("email"),
+            f"{DEALERSHIP_NAME} appointment confirmed",
+            msg + (f"\nCalendar: {link}" if link else "")
+        )
+
+        outcome = {
+            "slot": slot,
+            "vehicle": v,
+            "salesperson": sp,
+            "phone": s.get("phone"),
+            "email": s.get("email"),
+            "calendar_link": link
+        }
+        print("[BOOKED]", json.dumps(outcome, ensure_ascii=False))
+        post_analytics({"type": "booking", "payload": outcome})
+
+        s["state"] = "CLOSE"
+        return {
+            "reply": "Booked! I’ll send your confirmation shortly. Anything else I can help with?",
+            "handoff": False,
+            "end_call": False
+        }
+
+    # default fall-through
+    return {
+        "reply": "Thanks for calling. Have a great day!",
+        "handoff": False,
+        "end_call": True
+    }
