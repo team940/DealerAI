@@ -10,6 +10,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
+from rank_bm25 import BM25Okapi  # <-- RAG-lite
 
 # =========================
 # ---------- ENV ----------
@@ -32,7 +33,9 @@ SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
 FROM_EMAIL = os.getenv("FROM_EMAIL", "").strip()
 ANALYTICS_WEBHOOK_URL = os.getenv("ANALYTICS_WEBHOOK_URL", "").strip()
 
-VERSION = "0.3"
+RAG_ENABLED = os.getenv("RAG_ENABLED", "true").lower() == "true"
+
+VERSION = "0.5"
 
 # ============================
 # ---------- STATE ----------
@@ -47,7 +50,7 @@ def get_session(session_id: str) -> Dict[str, Any]:
         SESSIONS[session_id] = {
             "state": "GREETING",
             "intent": "sales_inquiry",
-            # target fields
+            # target fields to fill naturally
             "make": None,
             "model": None,
             "price_max": None,
@@ -57,12 +60,13 @@ def get_session(session_id: str) -> Dict[str, Any]:
             "color": None,
             # runtime
             "vehicle_hits": [],
+            "chosen_vehicle": None,
             "salesperson": None,
             "proposed": [],
             "chosen": None,
             "phone": None,
             "email": None,
-            "no_new_field_turns": 0,   # turns since a new field was captured
+            "no_new_field_turns": 0,
             "created_at": time.time(),
         }
     return SESSIONS[session_id]
@@ -72,6 +76,12 @@ def get_session(session_id: str) -> Dict[str, Any]:
 # =================================
 _inv_cache: List[Dict[str, Any]] = []
 _inv_age = 0
+
+# ---- RAG caches ----
+_rag_index: Optional[BM25Okapi] = None
+_rag_corpus: List[List[str]] = []
+_rag_rows: List[Dict[str, Any]] = []
+_rag_age = 0
 
 def _split_csv(line: str) -> List[str]:
     out, cur, q = [], "", False
@@ -86,28 +96,67 @@ def _split_csv(line: str) -> List[str]:
     out.append(cur)
     return out
 
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+def _row_doc(row: Dict[str, Any]) -> str:
+    """Create a compact doc string for BM25 to retrieve."""
+    primary = ["Year","Make","Model","Trim","Color","Condition","Mileage","Price","Body","Fuel","Drivetrain","VIN","Stock"]
+    parts = []
+    for k in primary:
+        val = str(row.get(k, "") or "").strip()
+        if val:
+            parts.append(f"{k}:{val}")
+    for k, v in row.items():
+        if k in primary: continue
+        vv = str(v or "").strip()
+        if vv:
+            parts.append(f"{k}:{vv}")
+    return " ".join(parts)
+
+def _build_rag(rows: List[Dict[str, Any]]):
+    """(Re)build a BM25 index over the inventory rows."""
+    global _rag_index, _rag_corpus, _rag_rows, _rag_age
+    try:
+        docs = [_row_doc(r) for r in rows]
+        _rag_corpus = [_tokenize(d) for d in docs]
+        _rag_rows = rows
+        _rag_index = BM25Okapi(_rag_corpus) if _rag_corpus else None
+        _rag_age = time.time()
+    except Exception as e:
+        print("RAG index build error:", e)
+        _rag_index = None
+        _rag_corpus = []
+        _rag_rows = []
+
 def load_inventory() -> List[Dict[str, Any]]:
-    """Load CSV inventory from Google Sheets (or any CSV URL). Cached for 60s."""
+    """Load CSV inventory from Google Sheets (or any CSV URL). Cached for 60s. Also refresh RAG."""
     global _inv_cache, _inv_age
     if _inv_cache and time.time() - _inv_age < 60:
         return _inv_cache
     rows: List[Dict[str, Any]] = []
     if not INVENTORY_CSV_URL:
-        _inv_cache = rows; _inv_age = time.time(); return rows
+        _inv_cache = rows; _inv_age = time.time()
+        if RAG_ENABLED: _build_rag(rows)
+        return rows
     try:
         with httpx.Client(timeout=12.0) as c:
             r = c.get(INVENTORY_CSV_URL)
             r.raise_for_status()
         lines = [ln for ln in r.text.splitlines() if ln.strip()]
         if not lines:
-            _inv_cache = []; _inv_age = time.time(); return []
+            _inv_cache = []; _inv_age = time.time()
+            if RAG_ENABLED: _build_rag([])
+            return []
         headers = [h.strip() for h in _split_csv(lines[0])]
         for ln in lines[1:]:
             cells = [x.strip() for x in _split_csv(ln)]
             rows.append({headers[i]: (cells[i] if i < len(cells) else "") for i in range(len(headers))})
     except Exception as e:
         print("ERROR fetching inventory CSV:", e)
-    _inv_cache = rows; _inv_age = time.time(); return rows
+    _inv_cache = rows; _inv_age = time.time()
+    if RAG_ENABLED: _build_rag(rows)
+    return rows
 
 def vehicle_blurb(v: Dict[str, Any]) -> str:
     year = str(v.get("Year", "")).strip()
@@ -148,7 +197,6 @@ CONDITION_WORDS = {
     "pre-owned": "Used",
     "certified": "Certified",
 }
-
 COLOR_WORDS = {
     "black":"Black","white":"White","silver":"Silver","gray":"Gray","grey":"Gray","blue":"Blue","red":"Red",
     "green":"Green","yellow":"Yellow","gold":"Gold","orange":"Orange","brown":"Brown","beige":"Beige"
@@ -168,13 +216,11 @@ YEAR_RE  = re.compile(r"(?:from|after|since|>=?)\s*(20\d{2}|19\d{2})|(?:year|mod
 MILES_RE = re.compile(r"(?:under|below|less than|<=?|<)\s*([0-9]{2,6})\s*(?:miles?|mi\b)", re.I)
 
 def extract_make_model(text: str, inv: Optional[List[Dict[str, Any]]] = None) -> Tuple[Optional[str], Optional[str]]:
-    """Forgiving extractor from free text."""
     if not text: return None, None
     inv = inv or load_inventory()
     makes = sorted({(r.get("Make") or "").strip().lower() for r in inv if r.get("Make")})
     models_raw = [(r.get("Model") or "").strip() for r in inv if r.get("Model")]
     models_norm = sorted({m.lower().replace("-", "").strip() for m in models_raw})
-
     words = re.findall(r"[A-Za-z0-9\-]+", text.lower())
     mk = md = None
     for w in words:
@@ -187,8 +233,7 @@ def extract_make_model(text: str, inv: Optional[List[Dict[str, Any]]] = None) ->
 def extract_price_max(text: str) -> Optional[int]:
     m = PRICE_RE.search(text or "")
     try:
-        if m:
-            return int(m.group(1))
+        if m: return int(m.group(1))
     except Exception:
         return None
     return None
@@ -205,8 +250,7 @@ def extract_year_min(text: str) -> Optional[int]:
 def extract_mileage_max(text: str) -> Optional[int]:
     m = MILES_RE.search(text or "")
     try:
-        if m:
-            return int(m.group(1))
+        if m: return int(m.group(1))
     except Exception:
         return None
     return None
@@ -224,9 +268,10 @@ def extract_color(text: str) -> Optional[str]:
     return None
 
 def fill_fields_from_text(s: Dict[str, Any], text: str) -> int:
-    """Try to fill any of the 7 fields from this turn. Returns number of newly filled fields."""
+    """Try to fill any of the 7 goal fields from this turn. Returns count of newly filled fields."""
     inv = load_inventory()
     before = sum(1 for f in GOAL_FIELDS if s.get(f))
+
     mk, md = extract_make_model(text, inv)
     price_max = extract_price_max(text)
     year_min = extract_year_min(text)
@@ -284,7 +329,7 @@ def matches_filters(v: Dict[str, Any], s: Dict[str, Any]) -> Tuple[bool, int]:
     if s.get("condition"):
         if (v.get("Condition","") or "").lower() != s["condition"].lower(): return (False, 0)
         score += 1
-    # color (loose contains)
+    # color (loose)
     if s.get("color"):
         if s["color"].lower() not in (v.get("Color","") or "").lower(): return (False, 0)
         score += 1
@@ -297,8 +342,8 @@ def search_inventory(s: Dict[str, Any], limit: int = 3) -> List[Dict[str, Any]]:
         ok, sc = matches_filters(v, s)
         if ok:
             scored.append((sc, v))
-    # If nothing matches strict filters, relax gradually (drop least important fields)
     if not scored:
+        # progressively relax the least important fields
         relaxed_order = ["color", "condition", "mileage_max", "year_min", "price_max", "model", "make"]
         tmp = dict(s)
         for f in relaxed_order:
@@ -309,11 +354,28 @@ def search_inventory(s: Dict[str, Any], limit: int = 3) -> List[Dict[str, Any]]:
                     ok, sc = matches_filters(v, tmp)
                     if ok:
                         scored.append((sc, v))
-                if scored:  # stop at first level that yields hits
+                if scored:
                     s["_relaxed"] = f
                     break
     scored.sort(key=lambda t: (-t[0], (t[1].get("Price") or "")))
     return [v for _, v in scored[:limit]]
+
+# ---------- RAG retrieval ----------
+def rag_search(query: str, k: int = 5) -> List[Dict[str, Any]]:
+    if not (RAG_ENABLED and query and _rag_index and _rag_corpus):
+        return []
+    try:
+        tokens = _tokenize(query)
+        scores = _rag_index.get_scores(tokens)
+        idxs = sorted(range(len(scores)), key=lambda i: -scores[i])[:k]
+        keep = []
+        for i in idxs:
+            if scores[i] > 0:
+                keep.append(_rag_rows[i])
+        return keep
+    except Exception as e:
+        print("RAG search error:", e)
+        return []
 
 # =================================
 # ---------- CALENDAR ------------
@@ -497,7 +559,6 @@ INTENTS: Dict[str, List[str]] = {
     "sales_inquiry": [
         r"\b(test[-\s]?drive|book|appointment|schedule)\b",
         r"\b(look(ing)? for|interested in|inventory|available|in stock|have any|show me)\b",
-        r"\b(civic|accord|camry|corolla|rav[\s-]?4|f[-\s]?150|model\s?[3syx])\b",
         r"\b(suv|sedan|truck|hatchback|coupe)\b"
     ],
     "service_request": [
@@ -582,32 +643,27 @@ async def webhooks_voice(turn: VoiceTurn):
     s = get_session(turn.session_id)
     text = (turn.transcript or "").strip()
 
-    # classify once, but keep sales as default
+    # classify once, default to sales
     if s.get("intent") is None:
         s["intent"] = classify_intent(text)
 
     # ---- GREETING ----
     if s["state"] == "GREETING":
         s["state"] = "COLLECT"
-        return {"reply": f"Thanks for calling {DEALERSHIP_NAME}! Tell me what you have in mind—make, model, budget, year, mileage, condition or even color, and I’ll find the best matches.",
+        return {"reply": f"Thanks for calling {DEALERSHIP_NAME}! Tell me what you have in mind—make, model, budget, year, mileage, condition or color—and I’ll pull the best matches.",
                 "handoff": False, "end_call": False}
 
-    # ---- PRESENT (already showed options) ----
+    # ---- PRESENT (we showed options already) ----
     if s["state"] == "PRESENT":
-        # If they say "first/second" or name one, jump to slots
         choice = None
-        if re.search(r"\bfirst\b", text.lower()):
-            choice = 0
-        elif re.search(r"\bsecond\b", text.lower()):
-            choice = 1
-        elif re.search(r"\bthird\b", text.lower()):
-            choice = 2
+        if re.search(r"\bfirst\b", text.lower()): choice = 0
+        elif re.search(r"\bsecond\b", text.lower()): choice = 1
+        elif re.search(r"\bthird\b", text.lower()): choice = 2
         else:
-            # try model+year match
             for i, v in enumerate(s.get("vehicle_hits") or []):
                 m = (v.get("Model","") or "").lower()
                 y = str(v.get("Year","") or "")
-                if m and m in text.lower() or (y and y in text):
+                if (m and m in text.lower()) or (y and y in text):
                     choice = i; break
 
         if choice is not None and (s.get("vehicle_hits") and 0 <= choice < len(s["vehicle_hits"])):
@@ -620,39 +676,59 @@ async def webhooks_voice(turn: VoiceTurn):
             return {"reply": f"Great choice — {vehicle_blurb(chosen_v)}. I can set up a quick test drive. Times: {', '.join(s['proposed'])}. What works for you?",
                     "handoff": False, "end_call": False}
 
-        # Otherwise keep collecting (maybe they added more filters)
+        # Otherwise continue collecting (maybe they added more filters)
         s["state"] = "COLLECT"
 
-    # ---- COLLECT (natural filling of fields) ----
+    # ---- COLLECT (natural filling of fields, minimal prompting) ----
     if s["state"] == "COLLECT":
         new_count = fill_fields_from_text(s, text)
-        if new_count > 0:
-            s["no_new_field_turns"] = 0
-        else:
-            s["no_new_field_turns"] += 1
+        if new_count > 0: s["no_new_field_turns"] = 0
+        else: s["no_new_field_turns"] += 1
 
         filled = [f for f in GOAL_FIELDS if s.get(f)]
-        # trigger search if enough signals OR user explicitly asked
-        enough = len(filled) >= 4 or re.search(r"\b(show|any|have|available|inventory|do you have)\b", text.lower())
+        # early RAG on explicit availability questions
+        if RAG_ENABLED and re.search(r"\b(show|any|have|available|inventory|what.*(have|available))\b", text.lower()):
+            rag_hits = rag_search(text, k=3)
+            if rag_hits:
+                s["vehicle_hits"] = rag_hits
+                s["state"] = "PRESENT"
+                top = "; ".join(vehicle_blurb(v) for v in rag_hits)
+                return {"reply": f"Here are a few options I found: {top}. Want to book a quick test drive—first, second, or third?",
+                        "handoff": False, "end_call": False}
 
+        # trigger strict search when ≥4 fields are filled, or user hints at availability
+        enough = len(filled) >= 4 or re.search(r"\b(any|have|available|inventory|do you have|show)\b", text.lower())
         if enough:
             hits = search_inventory(s, limit=3)
             s["vehicle_hits"] = hits
             if hits:
                 s["state"] = "PRESENT"
                 top = "; ".join(vehicle_blurb(v) for v in hits)
-                extra = ""
-                if s.get("_relaxed"):
-                    extra = f" (I relaxed '{s['_relaxed']}' to show options)."
-                return {"reply": f"Here are some good matches{extra}: {top}. Which one should I set up a test drive for—first, second, or third?",
+                extra = f" (I relaxed '{s['_relaxed']}')" if s.get("_relaxed") else ""
+                return {"reply": f"Here are solid matches{extra}: {top}. Which should I set a test drive for—first, second, or third?",
                         "handoff": False, "end_call": False}
             else:
-                # no hits yet—suggest a gentle narrowing
+                # strict miss: try RAG with the latest utterance + known fields
+                if RAG_ENABLED:
+                    qbits = [text]
+                    for f in ["make","model","color","condition"]:
+                        if s.get(f): qbits.append(str(s[f]))
+                    if s.get("price_max"):   qbits.append(f"under {s['price_max']} dollars")
+                    if s.get("year_min"):    qbits.append(f"year {s['year_min']} or newer")
+                    if s.get("mileage_max"): qbits.append(f"under {s['mileage_max']} miles")
+                    rag_hits = rag_search(" ".join(qbits), k=3)
+                    if rag_hits:
+                        s["vehicle_hits"] = rag_hits
+                        s["state"] = "PRESENT"
+                        top = "; ".join(vehicle_blurb(v) for v in rag_hits)
+                        return {"reply": f"I didn’t see an exact match, but these look close: {top}. Which one works—first, second, or third?",
+                                "handoff": False, "end_call": False}
+                # still nothing—nudge for more signal
                 s["state"] = "COLLECT"
-                return {"reply": "I didn’t see anything with those exact filters. Want to adjust the budget, year, or color a bit and I’ll re-check?",
+                return {"reply": "I didn’t see anything with those exact filters. Want to tweak the budget, year, or color and I’ll re-check?",
                         "handoff": False, "end_call": False}
 
-        # If not enough yet and we’ve had 2 turns with no new info, ask the next missing field
+        # No search yet: after 2 empty turns, ask next missing field in the defined order
         if s["no_new_field_turns"] >= 2:
             for f in GOAL_FIELDS:
                 if not s.get(f):
@@ -661,36 +737,33 @@ async def webhooks_voice(turn: VoiceTurn):
                         "make": "Do you have a make in mind—like Honda, Toyota, or Chevy?",
                         "model": "Any model you’re leaning toward—Civic, Camry, Accord?",
                         "price_max": "What’s a comfortable budget to stay under?",
-                        "year_min": "Is there a model year you’d prefer—from what year and newer?",
+                        "year_min": "From which model year and newer should I look?",
                         "mileage_max": "Any mileage cap you want to stay under?",
                         "condition": "New, used, or certified?",
                         "color": "Any color preferences?"
                     }
                     return {"reply": prompts[f], "handoff": False, "end_call": False}
 
-        # Otherwise, acknowledge and keep listening—no forced question
+        # Otherwise, acknowledge and keep it open
         ack_bits = []
         for key, label in [("make","make"),("model","model"),("price_max","budget"),
                            ("year_min","year"),("mileage_max","mileage"),("condition","condition"),("color","color")]:
             if s.get(key): ack_bits.append(label)
         if ack_bits:
-            return {"reply": f"Got it on {', '.join(ack_bits)}. Anything else you want me to factor in—like year, mileage, condition or color?",
+            return {"reply": f"Noted on {', '.join(ack_bits)}. Anything else to factor in—year, mileage, condition, or color?",
                     "handoff": False, "end_call": False}
         else:
-            return {"reply": "Tell me anything you care about—make, model, price, year, mileage, condition or color—and I’ll pull matches.",
+            return {"reply": "Share anything you care about—make, model, price, year, mileage, condition or color—and I’ll pull matches.",
                     "handoff": False, "end_call": False}
 
     # ---- SLOTS ----
     if s["state"] == "SLOTS":
         chosen = None
         txt = text.lower()
-        # allow “morning/afternoon” mapping
         if "morning" in txt and s["proposed"]: chosen = s["proposed"][0]
         if "afternoon" in txt and len(s["proposed"]) > 1: chosen = s["proposed"][1]
-        # ordinal shortcuts
         if re.search(r"\bfirst\b", txt) and s["proposed"]: chosen = s["proposed"][0]
         if re.search(r"\bsecond\b", txt) and len(s["proposed"])>1: chosen = s["proposed"][1]
-        # exact include
         for sl in s["proposed"]:
             if sl.lower() in txt: chosen = sl; break
 
