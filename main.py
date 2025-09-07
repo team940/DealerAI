@@ -32,7 +32,7 @@ SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
 FROM_EMAIL = os.getenv("FROM_EMAIL", "").strip()
 ANALYTICS_WEBHOOK_URL = os.getenv("ANALYTICS_WEBHOOK_URL", "").strip()
 
-VERSION = "0.2"
+VERSION = "0.3"
 
 # ============================
 # ---------- STATE ----------
@@ -136,7 +136,7 @@ def _closest(token: str, options: List[str], cutoff: float = 0.84) -> Optional[s
 
 def extract_make_model(text: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    More forgiving extractor: handles plurals, hyphens, common synonyms, and mild typos.
+    Forgiving extractor: handles plurals, hyphens, common synonyms, and mild typos.
     """
     if not text:
         return None, None
@@ -150,12 +150,10 @@ def extract_make_model(text: str) -> Tuple[Optional[str], Optional[str]]:
 
     for w in words:
         wn = w.replace("-", "")
-        # very light singularization
         candidates = {wn}
         if wn.endswith("ies"): candidates.add(wn[:-3] + "y")
         if wn.endswith("es"):  candidates.add(wn[:-2])
         if wn.endswith("s"):   candidates.add(wn[:-1])
-        # canonicalize
         can_makes = {_canon_make(c) for c in candidates}
         can_models = {_canon_model(c) for c in candidates}
 
@@ -185,29 +183,105 @@ def extract_make_model(text: str) -> Tuple[Optional[str], Optional[str]]:
 
     return mk, md
 
-def find_vehicle(make: Optional[str], model: Optional[str]) -> Optional[Dict[str, Any]]:
+# ---------- Additional lightweight filters ----------
+BODY_STYLES = {"suv","sedan","truck","coupe","hatchback","van","minivan","convertible","crossover"}
+COLOR_WORDS = {"black","white","silver","gray","grey","red","blue","green","brown","beige","gold","yellow","orange"}
+
+def parse_budget(text: str) -> Optional[int]:
     """
-    Find the first matching vehicle with tolerant matching.
-    Prefers entries where both make and model match; otherwise returns model-only matches.
+    Extract a rough max budget from phrases like:
+    - 'under 25k', 'below 30,000', '$22,500', 'around 20k'
+    Returns an integer dollar amount or None.
+    """
+    t = text.lower().replace(",", "")
+    # explicit $amount
+    m = re.search(r"\$?\s*(\d{4,6})\b", t)
+    if m:
+        val = int(m.group(1))
+        # treat 20000..200000 as dollars; 2000..9999 could be year, allow but keep
+        if 10000 <= val <= 200000:
+            return val
+    # 25k style
+    m = re.search(r"(\d{2,3})\s*k\b", t)
+    if m:
+        return int(m.group(1)) * 1000
+    # under/below/around X
+    m = re.search(r"(under|below|less than|around|about)\s+(\d{2,3})\s*k", t)
+    if m:
+        return int(m.group(2)) * 1000
+    return None
+
+def parse_year(text: str) -> Optional[str]:
+    m = re.search(r"\b(20\d{2}|19\d{2})\b", text)
+    if m:
+        return m.group(1)
+    return None
+
+def parse_body_style(text: str) -> Optional[str]:
+    t = text.lower()
+    for w in BODY_STYLES:
+        if re.search(rf"\b{re.escape(w)}\b", t):
+            return w
+    return None
+
+def parse_color(text: str) -> Optional[str]:
+    t = text.lower()
+    for c in COLOR_WORDS:
+        if re.search(rf"\b{re.escape(c)}\b", t):
+            return c
+    return None
+
+def parse_filters(text: str) -> Dict[str, Any]:
+    mk, md = extract_make_model(text)
+    year = parse_year(text)
+    body = parse_body_style(text)
+    color = parse_color(text)
+    budget = parse_budget(text)
+    return {"make": mk, "model": md, "year": year, "body": body, "color": color, "budget": budget}
+
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _price_to_int(s: str) -> Optional[int]:
+    if not s: return None
+    try:
+        s2 = re.sub(r"[^\d]", "", s)
+        return int(s2) if s2 else None
+    except Exception:
+        return None
+
+def search_inventory(filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Return vehicles matching any provided filters.
+    We apply AND across provided fields; each field uses a tolerant contains match.
     """
     inv = load_inventory()
-    mk = (make or "").lower()
-    md = (model or "").lower().replace("-", "")
+    mk = (filters.get("make") or "").lower()
+    md = (filters.get("model") or "").lower().replace("-", "")
+    yr = (filters.get("year") or "").lower()
+    body = (filters.get("body") or "").lower()
+    color = (filters.get("color") or "").lower()
+    budget = filters.get("budget")
 
-    best: Optional[Dict[str, Any]] = None
+    results: List[Dict[str, Any]] = []
     for r in inv:
-        rmk = (r.get("Make", "") or "").lower()
-        rmd = (r.get("Model", "") or "").lower().replace("-", "")
-        score = 0
-        if md and md in rmd: score += 2
-        if mk and mk in rmk: score += 1
-        if not md and mk and mk in rmk: score += 1  # make-only queries
-        if score > 0 and (best is None or score > best["_score"]):
-            best = dict(r)
-            best["_score"] = score
-    if best:
-        best.pop("_score", None)
-    return best
+        rmk = _norm(r.get("Make"))
+        rmd = _norm(r.get("Model")).replace("-", "")
+        ryr = _norm(str(r.get("Year")))
+        rbody = _norm(r.get("Body") or r.get("Type") or r.get("Category"))
+        rcolor = _norm(r.get("Color"))
+        rprice = _price_to_int(str(r.get("Price")))
+
+        # AND across provided filters
+        if mk and mk not in rmk: continue
+        if md and md not in rmd: continue
+        if yr and yr not in ryr: continue
+        if body and body not in rbody: continue
+        if color and color not in rcolor: continue
+        if budget and rprice and rprice > budget: continue
+
+        results.append(r)
+    return results
 
 def vehicle_blurb(v: Dict[str, Any]) -> str:
     year = str(v.get("Year", "")).strip()
@@ -222,6 +296,27 @@ def vehicle_blurb(v: Dict[str, Any]) -> str:
     if cond:  bits.append(cond)
     if price: bits.append(f"${price}")
     return " · ".join(bits)
+
+def compose_inventory_reply(matches: List[Dict[str, Any]], filters: Dict[str, Any]) -> str:
+    """
+    Natural one-liner that answers the user's question first.
+    """
+    if not matches:
+        want = []
+        if filters.get("make"): want.append(filters["make"].title())
+        if filters.get("model"): want.append(filters["model"].title())
+        if filters.get("body"): want.append(filters["body"])
+        if filters.get("year"): want.append(filters["year"])
+        if filters.get("color"): want.append(filters["color"])
+        if filters.get("budget"): want.append(f"under ${filters['budget']:,}")
+        wish = " ".join(want) if want else "that exact vehicle"
+        return f"I’m not seeing {wish} right now. We can look at close alternatives if you’d like."
+
+    top = matches[:3]
+    listed = ", ".join(vehicle_blurb(v) for v in top)
+    extra = len(matches) - len(top)
+    suffix = f" (plus {extra} more)" if extra > 0 else ""
+    return f"Yes — we have {listed}{suffix}."
 
 # =================================
 # ---------- CALENDAR ------------
@@ -289,7 +384,6 @@ def propose_slots(sales_cal_id: Optional[str]) -> List[str]:
         slots = []
         d = now
         while d < horizon and len(slots) < 2:
-            # business-hours aware (if provided)
             wd = ["mon","tue","wed","thu","fri","sat","sun"][d.weekday()]
             start_hour, end_hour = (hours.get(wd, [9, 18]) if isinstance(hours.get(wd, []), list) else [9, 18])
             for hour in [start_hour, max(start_hour+2, 11), max(start_hour+4, 13), min(end_hour-3, 15)]:
@@ -302,7 +396,6 @@ def propose_slots(sales_cal_id: Optional[str]) -> List[str]:
             d = (d + timedelta(days=1)).replace(hour=start_hour, minute=0)
         if slots:
             return slots
-    # fallback
     try:
         return json.loads(APPT_DEFAULT_SLOTS_JSON)[:2]
     except Exception:
@@ -344,7 +437,7 @@ def create_calendar_event(sp, customer_email, customer_phone, start_str, title, 
         "summary": title,
         "description": description,
         "start": {"dateTime": start.astimezone(ZoneInfo("UTC")).isoformat(), "timeZone": TIMEZONE},
-        "end":   {"dateTime": end.astimezone(ZoneInfo("UTC")).isoformat(),   "timeZone": TIMEZONE},
+        "end":   {"dateTime": end.astimezone(ZoneInfo("UTC")).isoformat(), "timeZone": TIMEZONE},
         "attendees": [{"email": sp.get("email")}] + ([{"email": customer_email}] if customer_email else []),
     }
     try:
@@ -386,7 +479,7 @@ def post_analytics(payload: Dict[str, Any]):
         return
     try:
         safe = json.loads(json.dumps(payload, ensure_ascii=False))
-        # very light PII scrubbing in analytics
+        # light PII scrubbing for analytics
         if "payload" in safe and isinstance(safe["payload"], dict):
             p = safe["payload"]
             if "phone" in p: p["phone"] = "***REDACTED***"
@@ -417,7 +510,7 @@ def extract_contact(text: str) -> Tuple[Optional[str], Optional[str]]:
 INTENTS: Dict[str, List[str]] = {
     "sales_inquiry": [
         r"\b(test[-\s]?drive|book|appointment)\b",
-        r"\b(look(ing)? for|interested in|inventory|available|in stock)\b",
+        r"\b(look(ing)? for|interested in|inventory|available|in stock|have any|got any)\b",
         r"\b(civic|accord|camry|corolla|rav[\s-]?4|f[-\s]?150|model\s?[3syx])\b",
         r"\b(suv|sedan|truck|hatchback|coupe)\b"
     ],
@@ -438,7 +531,7 @@ def classify_intent(text: str) -> str:
         for p in patterns:
             if re.search(p, t):
                 return name
-    return "sales_inquiry"  # default path you care about
+    return "sales_inquiry"  # default path
 
 # =================================
 # ---------- API -----------------
@@ -471,7 +564,7 @@ class VoiceTurn(BaseModel):
     transcript: Optional[str] = ""
     caller_phone: Optional[str] = None
 
-# SALESPEOPLE utils (kept here to avoid reordering)
+# SALESPEOPLE utils
 def load_salespeople() -> List[Dict[str, Any]]:
     try:
         return [a for a in json.loads(SALESPEOPLE_JSON or "[]") if a.get("name")]
@@ -493,6 +586,21 @@ def pick_salesperson_round_robin() -> Optional[Dict[str, Any]]:
     _round_robin_idx += 1
     return sp
 
+# ---------- Affirmation helpers ----------
+YES_WORDS = {"yes","yeah","yep","sure","sounds good","ok","okay","let's do it","book","schedule","set it up","come by","come in","test drive"}
+NO_WORDS  = {"no","not now","maybe later","just looking","browsing"}
+
+def _wants_booking(text: str) -> bool:
+    t = (text or "").lower()
+    return any(w in t for w in YES_WORDS) or "test drive" in t or "see it" in t
+
+def _declines_booking(text: str) -> bool:
+    t = (text or "").lower()
+    return any(w in t for w in NO_WORDS)
+
+# =================================
+# ---------- VOICE WEBHOOK -------
+# =================================
 @app.post("/webhooks/voice")
 async def webhooks_voice(turn: VoiceTurn):
     # Debug trace for observability
@@ -514,68 +622,111 @@ async def webhooks_voice(turn: VoiceTurn):
             s["state"] = "INFO"
             addr = f" Our address is {DEALERSHIP_ADDRESS}." if DEALERSHIP_ADDRESS else ""
             return {"reply": f"We’re open most days 9 AM to 6 PM.{addr} Would you like to book a visit?", "handoff": False, "end_call": False}
-        # smalltalk just flows into sales politely
+        # smalltalk & default → sales
         s["state"] = "QUALIFY"
-        return {"reply": f"Thanks for calling {DEALERSHIP_NAME}! Which car are you interested in? You can say make and model.", "handoff": False, "end_call": False}
+        return {"reply": f"Thanks for calling {DEALERSHIP_NAME}! Which car are you interested in? You can say make, model, or even a color/budget.", "handoff": False, "end_call": False}
 
-    # -------- SALES FLOW --------
+    # -------- SALES FLOW (Flexible) --------
     if s["state"] == "QUALIFY":
-        mk, md = extract_make_model(text)
-        if mk: s["make"] = mk
-        if md: s["model"] = md
+        # Merge new cues with prior context
+        filters = parse_filters(text)
+        if filters.get("make"):  s["make"]  = filters["make"]
+        if filters.get("model"): s["model"] = filters["model"]
 
-        if not s.get("model"):
-            # Offer top 3 popular models from inv to guide the caller
+        # If we have no filters at all, gently guide with popular options
+        if not any(filters.values()) and not (s.get("make") or s.get("model")):
             inv = load_inventory()
-            top_models = []
-            seen = set()
+            seen_makes, top_makes = set(), []
+            seen_models, top_models = set(), []
             for r in inv:
-                m = (r.get("Model") or "").strip()
-                if m and m.lower() not in seen:
-                    seen.add(m.lower()); top_models.append(m)
-                if len(top_models) == 3: break
-            opts = ", ".join(top_models) if top_models else "the model name"
-            return {"reply": f"Got it. Which model are you looking for? For example: {opts}.", "handoff": False, "end_call": False}
+                mk = (r.get("Make") or "").strip()
+                md = (r.get("Model") or "").strip()
+                if mk and mk.lower() not in seen_makes:
+                    seen_makes.add(mk.lower()); top_makes.append(mk)
+                if md and md.lower() not in seen_models:
+                    seen_models.add(md.lower()); top_models.append(md)
+                if len(top_makes) >= 3 and len(top_models) >= 3: break
+            prompt = "Any particular make or model you had in mind"
+            examples = f"— for example: {', '.join(top_models[:3])} or {', '.join(top_makes[:3])}"
+            return {"reply": f"Got it. {prompt}{examples}?", "handoff": False, "end_call": False}
 
-        v = find_vehicle(s.get("make"), s.get("model"))
-        if v:
-            s["vehicle"] = v
+        # Build a combined filter with context memory
+        combined = {
+            "make":  s.get("make")  or filters.get("make"),
+            "model": s.get("model") or filters.get("model"),
+            "year":  filters.get("year"),
+            "body":  filters.get("body"),
+            "color": filters.get("color"),
+            "budget":filters.get("budget"),
+        }
+
+        matches = search_inventory(combined)
+        reply = compose_inventory_reply(matches, combined)
+
+        # If we found something, move toward booking naturally
+        if matches:
+            # Store the "primary" vehicle for downstream (first best match)
+            s["vehicle"] = matches[0]
             sp = pick_salesperson_by_name(text) or pick_salesperson_round_robin()
             s["salesperson"] = sp
-            s["proposed"] = propose_slots(sp.get("calendar_id") if sp else None)
-            s["state"] = "SLOTS"
-            post_analytics({"type": "inventory_hit", "payload": {"make": s.get("make"), "model": s.get("model")}})
-            return {"reply": f"We have {vehicle_blurb(v)} available. Times: {', '.join(s['proposed'])}. What works for you?",
-                    "handoff": False, "end_call": False}
-        else:
-            # Suggest closest two models as alternatives
-            inv = load_inventory()
-            models_norm = sorted({(r.get("Model") or "").strip().lower().replace("-", "") for r in inv if r.get("Model")})
-            wanted = (s.get("model") or "")
-            alts = difflib.get_close_matches(wanted, models_norm, n=2, cutoff=0.6)
-            alt_text = f" Perhaps {', '.join(alts)}?" if alts else ""
-            post_analytics({"type": "inventory_miss", "payload": {"query_model": s.get("model")}})
-            return {"reply": f"I couldn’t find that exact vehicle in our inventory.{alt_text} Want to try a different make or model?",
-                    "handoff": False, "end_call": False}
 
+            # If caller explicitly wants to come in, jump straight to SLOTS
+            if _wants_booking(text):
+                s["proposed"] = propose_slots(sp.get("calendar_id") if sp else None)
+                s["state"] = "SLOTS"
+                return {"reply": f"{reply} I can set up a quick visit. {', '.join(s['proposed'])} work for you?",
+                        "handoff": False, "end_call": False}
+
+            # Otherwise answer first, then nudge
+            s["proposed"] = propose_slots(sp.get("calendar_id") if sp else None)
+            nudge = "Want to pop in for a quick look or test drive?"
+            if s["proposed"]:
+                nudge = f"Want to pop in for a quick look or test drive? I have {', '.join(s['proposed'])}."
+            return {"reply": f"{reply} {nudge}", "handoff": False, "end_call": False}
+
+        # No matches → suggest close alternatives by model
+        inv = load_inventory()
+        models_norm = sorted({(r.get("Model") or "").strip().lower().replace("-", "") for r in inv if r.get("Model")})
+        wanted = (combined.get("model") or "") or (combined.get("body") or "")
+        alts = difflib.get_close_matches(wanted, models_norm, n=2, cutoff=0.6) if wanted else []
+        alt_text = f" Maybe {', '.join(alts)}?" if alts else ""
+        post_analytics({"type": "inventory_miss", "payload": {"query": combined}})
+        return {"reply": f"{reply}{alt_text} Tell me a must-have—make, model, body style, color, or budget—and I’ll narrow it down.",
+                "handoff": False, "end_call": False}
+
+    # -------- SLOT SELECTION --------
     if s["state"] == "SLOTS":
+        # Allow direct selection or generic yes
+        if _wants_booking(text) and not s.get("proposed"):
+            sp = s.get("salesperson") or pick_salesperson_round_robin()
+            s["salesperson"] = sp
+            s["proposed"] = propose_slots(sp.get("calendar_id") if sp else None)
+
         chosen = None
-        for sl in s["proposed"]:
+        for sl in (s.get("proposed") or []):
             if sl and sl.lower() in text.lower():
                 chosen = sl; break
         if not chosen:
-            if re.search(r"\bfirst\b", text.lower()) and s["proposed"]:
+            if re.search(r"\bfirst\b", text.lower()) and s.get("proposed"):
                 chosen = s["proposed"][0]
-            elif re.search(r"\bsecond\b", text.lower()) and len(s["proposed"]) > 1:
+            elif re.search(r"\bsecond\b", text.lower()) and s.get("proposed") and len(s["proposed"]) > 1:
                 chosen = s["proposed"][1]
+
         if not chosen:
-            return {"reply": f"Which works best: {', '.join(s['proposed'])}?", "handoff": False, "end_call": False}
+            # If user declines, drop back to QUALIFY without pressure
+            if _declines_booking(text):
+                s["state"] = "QUALIFY"
+                return {"reply": "No problem. What else can I look up for you—another model, color, or budget?",
+                        "handoff": False, "end_call": False}
+            return {"reply": f"Which time works best: {', '.join(s.get('proposed') or [])}?",
+                    "handoff": False, "end_call": False}
 
         s["chosen"] = chosen
         s["state"] = "CONTACT"
         return {"reply": "Great—what’s the best phone number and email for confirmation?",
                 "handoff": False, "end_call": False}
 
+    # -------- CONTACT / CONFIRM --------
     if s["state"] == "CONTACT":
         ph, em = extract_contact(text)
         if turn.caller_phone and not s["phone"]: s["phone"] = turn.caller_phone
@@ -616,9 +767,8 @@ async def webhooks_voice(turn: VoiceTurn):
         return {"reply": "Booked! I’ll send your confirmation shortly. Anything else I can help with?",
                 "handoff": False, "end_call": False}
 
-    # -------- SERVICE (MVP stub) --------
+    # -------- SERVICE (MVP) --------
     if s["state"] == "SERVICE_GREETING":
-        # Minimal MVP: capture issue then contact
         if "issue" not in s or not s.get("issue"):
             s["issue"] = text
             return {"reply": "Thanks. I’ll get a service advisor to follow up. What’s the best phone and email?", "handoff": False, "end_call": False}
