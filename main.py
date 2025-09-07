@@ -32,7 +32,7 @@ SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
 FROM_EMAIL = os.getenv("FROM_EMAIL", "").strip()
 ANALYTICS_WEBHOOK_URL = os.getenv("ANALYTICS_WEBHOOK_URL", "").strip()
 
-VERSION = "0.4"
+VERSION = "0.3"
 
 # ============================
 # ---------- STATE ----------
@@ -40,19 +40,29 @@ VERSION = "0.4"
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 _round_robin_idx = 0
 
+GOAL_FIELDS = ["make", "model", "price_max", "year_min", "mileage_max", "condition", "color"]
+
 def get_session(session_id: str) -> Dict[str, Any]:
     if session_id not in SESSIONS:
         SESSIONS[session_id] = {
             "state": "GREETING",
-            "intent": None,
+            "intent": "sales_inquiry",
+            # target fields
             "make": None,
             "model": None,
-            "vehicle": None,
+            "price_max": None,
+            "year_min": None,
+            "mileage_max": None,
+            "condition": None,
+            "color": None,
+            # runtime
+            "vehicle_hits": [],
             "salesperson": None,
             "proposed": [],
             "chosen": None,
             "phone": None,
             "email": None,
+            "no_new_field_turns": 0,   # turns since a new field was captured
             "created_at": time.time(),
         }
     return SESSIONS[session_id]
@@ -77,10 +87,7 @@ def _split_csv(line: str) -> List[str]:
     return out
 
 def load_inventory() -> List[Dict[str, Any]]:
-    """
-    Load CSV inventory from Google Sheets (or any CSV URL).
-    Cached for 60s to keep responses fast.
-    """
+    """Load CSV inventory from Google Sheets (or any CSV URL). Cached for 60s."""
     global _inv_cache, _inv_age
     if _inv_cache and time.time() - _inv_age < 60:
         return _inv_cache
@@ -102,169 +109,6 @@ def load_inventory() -> List[Dict[str, Any]]:
         print("ERROR fetching inventory CSV:", e)
     _inv_cache = rows; _inv_age = time.time(); return rows
 
-# -------- Canonicalization / fuzzy --------
-MAKE_SYNONYMS = {
-    "chevy": "chevrolet",
-    "vw": "volkswagen",
-    "merc": "mercedes-benz", "benz": "mercedes-benz",
-    "bimmer": "bmw",
-}
-MODEL_SYNONYMS = {
-    "civics": "civic", "accords": "accord",
-    "rav 4": "rav4", "rav-4": "rav4", "rav4s": "rav4",
-    "f150": "f-150", "f-150": "f-150",
-    "model3": "model 3", "model-y": "model y",
-}
-BODY_STYLES = {"suv","sedan","truck","coupe","hatchback","van","minivan","convertible","crossover"}
-COLOR_WORDS = {"black","white","silver","gray","grey","red","blue","green","brown","beige","gold","yellow","orange"}
-VEHICLE_TERMS = {"car","vehicle","truck","suv","van","minivan","coupe","hatchback","convertible","crossover","auto"}
-
-def _canon_make(s: str) -> str:  return MAKE_SYNONYMS.get(s, s)
-def _canon_model(s: str) -> str: return MODEL_SYNONYMS.get(s, s)
-def _closest(token: str, options: List[str], cutoff: float = 0.84) -> Optional[str]:
-    match = difflib.get_close_matches(token, options, n=1, cutoff=cutoff)
-    return match[0] if match else None
-
-def _index_makes_models() -> Tuple[set, set]:
-    inv = load_inventory()
-    makes = { (r.get("Make") or "").strip().lower() for r in inv if r.get("Make") }
-    models = { (r.get("Model") or "").strip().lower().replace("-", "") for r in inv if r.get("Model") }
-    return makes, models
-
-def extract_make_model(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Forgiving make/model detector.
-    """
-    if not text:
-        return None, None
-    makes, models_norm = _index_makes_models()
-    words = re.findall(r"[A-Za-z0-9\-]+", text.lower())
-    mk = md = None
-    for w in words:
-        wn = w.replace("-", "")
-        cands = {wn}
-        if wn.endswith("ies"): cands.add(wn[:-3] + "y")
-        if wn.endswith("es"):  cands.add(wn[:-2])
-        if wn.endswith("s"):   cands.add(wn[:-1])
-        can_makes  = {_canon_make(c) for c in cands}
-        can_models = {_canon_model(c) for c in cands}
-        if not mk and any(c in makes for c in can_makes):
-            mk = next(c for c in can_makes if c in makes)
-        if not md and any(c.replace("-", "") in models_norm for c in can_models):
-            md = next(c for c in can_models if c.replace("-", "") in models_norm)
-    if not md:
-        for w in words:
-            guess = _closest(_canon_model(w.replace("-", "")), sorted(models_norm), cutoff=0.82)
-            if guess: md = guess; break
-    if not mk:
-        for w in words:
-            guess = _closest(_canon_make(w), sorted(makes), cutoff=0.82)
-            if guess: mk = guess; break
-    return mk, md
-
-# ---------- Additional lightweight filters ----------
-def parse_budget(text: str) -> Optional[int]:
-    """
-    Max price detector: '$22,500', 'under 25k', 'below 30k', 'around 20k'
-    """
-    t = text.lower().replace(",", "")
-    m = re.search(r"(under|below|less than|around|about)\s*(\d{2,3})\s*k", t)
-    if m: return int(m.group(2)) * 1000
-    m = re.search(r"\$?\s*(\d{5,6})\b", t)  # $10,000+ as price
-    if m: return int(m.group(1))
-    m = re.search(r"(\d{2,3})\s*k\b", t)
-    if m: return int(m.group(1)) * 1000
-    return None
-
-def parse_year(text: str) -> Optional[str]:
-    m = re.search(r"\b(20\d{2}|19\d{2})\b", text)
-    return m.group(1) if m else None
-
-def parse_body_style(text: str) -> Optional[str]:
-    t = text.lower()
-    for w in BODY_STYLES:
-        if re.search(rf"\b{re.escape(w)}\b", t):
-            return w
-    return None
-
-def parse_color(text: str) -> Optional[str]:
-    t = text.lower()
-    for c in COLOR_WORDS:
-        if re.search(rf"\b{re.escape(c)}\b", t):
-            return c
-    return None
-
-def parse_mileage(text: str) -> Optional[int]:
-    """
-    Max mileage detector: 'under 40k miles', 'less than 30,000 miles', 'mileage under 50k'
-    """
-    t = text.lower().replace(",", "")
-    m = re.search(r"(under|below|less than)\s*(\d{2,3})\s*k\s*miles?", t)
-    if m: return int(m.group(2)) * 1000
-    m = re.search(r"(\d{4,6})\s*miles?", t)
-    if m: return int(m.group(1))
-    m = re.search(r"(\d{2,3})\s*k\s*miles?", t)
-    if m: return int(m.group(1)) * 1000
-    return None
-
-def parse_filters(text: str) -> Dict[str, Any]:
-    mk, md = extract_make_model(text)
-    return {
-        "make": mk,
-        "model": md,
-        "year":  parse_year(text),
-        "body":  parse_body_style(text),
-        "color": parse_color(text),
-        "budget": parse_budget(text),
-        "mileage_max": parse_mileage(text),
-    }
-
-def _norm(s: str) -> str:
-    return (s or "").strip().lower()
-
-def _int_from_str(s: str) -> Optional[int]:
-    if not s: return None
-    try:
-        s2 = re.sub(r"[^\d]", "", str(s))
-        return int(s2) if s2 else None
-    except Exception:
-        return None
-
-def search_inventory(filters: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    AND across provided filters; each filter is tolerant 'contains'/<= for numbers.
-    Supported columns: Make, Model, Year, Body/Type/Category, Color, Price, Mileage/Odometer.
-    """
-    inv = load_inventory()
-    mk = _norm(filters.get("make"))
-    md = _norm(filters.get("model")).replace("-", "") if filters.get("model") else ""
-    yr = _norm(filters.get("year"))
-    body = _norm(filters.get("body"))
-    color = _norm(filters.get("color"))
-    budget = filters.get("budget")
-    mil_max = filters.get("mileage_max")
-
-    results: List[Dict[str, Any]] = []
-    for r in inv:
-        rmk = _norm(r.get("Make"))
-        rmd = _norm(r.get("Model")).replace("-", "")
-        ryr = _norm(str(r.get("Year")))
-        rbody = _norm(r.get("Body") or r.get("Type") or r.get("Category"))
-        rcolor = _norm(r.get("Color"))
-        rprice = _int_from_str(r.get("Price"))
-        rmiles = _int_from_str(r.get("Mileage") or r.get("Odometer"))
-
-        if mk and mk not in rmk: continue
-        if md and md not in rmd: continue
-        if yr and yr not in ryr: continue
-        if body and body not in rbody: continue
-        if color and color not in rcolor: continue
-        if budget and rprice and rprice > budget: continue
-        if mil_max and rmiles and rmiles > mil_max: continue
-
-        results.append(r)
-    return results
-
 def vehicle_blurb(v: Dict[str, Any]) -> str:
     year = str(v.get("Year", "")).strip()
     make = v.get("Make", "").strip()
@@ -272,51 +116,204 @@ def vehicle_blurb(v: Dict[str, Any]) -> str:
     color = v.get("Color", "").strip()
     cond  = v.get("Condition", "").strip()
     price = v.get("Price", "").strip()
-    miles = v.get("Mileage") or v.get("Odometer") or ""
-    miles_s = f"{int(_int_from_str(miles)):,} mi" if _int_from_str(miles) else ""
     bits = []
     if year and model: bits.append(f"{year} {make} {model}")
     if color: bits.append(color)
-    if miles_s: bits.append(miles_s)
     if cond:  bits.append(cond)
     if price: bits.append(f"${price}")
     return " · ".join(bits)
 
-def compose_inventory_reply(matches: List[Dict[str, Any]], filters: Dict[str, Any]) -> str:
-    if not matches:
-        want = []
-        for k in ("make","model","year","body","color"):
-            if filters.get(k): want.append(str(filters[k]).title())
-        if filters.get("budget"): want.append(f"under ${filters['budget']:,}")
-        if filters.get("mileage_max"): want.append(f"under {int(filters['mileage_max']):,} miles")
-        wish = " ".join(want) if want else "that exact vehicle"
-        return f"I’m not seeing {wish} right now. We can look at close alternatives if you’d like."
+# --- normalization helpers ---
+MAKE_SYNONYMS = {
+    "chevy": "chevrolet",
+    "vw": "volkswagen",
+    "merc": "mercedes-benz",
+    "benz": "mercedes-benz",
+    "bimmer": "bmw",
+}
+MODEL_SYNONYMS = {
+    "civics": "civic",
+    "accords": "accord",
+    "rav 4": "rav4",
+    "rav-4": "rav4",
+    "f150": "f-150",
+    "model3": "model 3",
+    "model-y": "model y",
+}
+CONDITION_WORDS = {
+    "new": "New",
+    "brand new": "New",
+    "used": "Used",
+    "preowned": "Used",
+    "pre-owned": "Used",
+    "certified": "Certified",
+}
 
-    top = matches[:3]
-    listed = ", ".join(vehicle_blurb(v) for v in top)
-    extra = len(matches) - len(top)
-    suffix = f" (plus {extra} more)" if extra > 0 else ""
-    return f"Yes — we have {listed}{suffix}."
+COLOR_WORDS = {
+    "black":"Black","white":"White","silver":"Silver","gray":"Gray","grey":"Gray","blue":"Blue","red":"Red",
+    "green":"Green","yellow":"Yellow","gold":"Gold","orange":"Orange","brown":"Brown","beige":"Beige"
+}
 
-# ---------- “Should I search?” trigger ----------
-def should_search_now(text: str) -> bool:
-    if not text: return False
-    t = text.lower()
-    # any generic vehicle term
-    if any(re.search(rf"\b{re.escape(k)}\b", t) for k in VEHICLE_TERMS):
-        return True
-    # numbers that look like price/year/mileage
-    if parse_budget(t) or parse_year(t) or parse_mileage(t):
-        return True
-    # body style / color terms
-    if parse_body_style(t) or parse_color(t):
-        return True
-    # any known make/model seen in text tokens
-    makes, models = _index_makes_models()
-    tokens = set(re.findall(r"[a-z0-9\-]+", t))
-    if tokens & makes: return True
-    if any(tok.replace("-", "") in models for tok in tokens): return True
-    return False
+def _canon_make(s: str) -> str:
+    return MAKE_SYNONYMS.get(s, s)
+
+def _canon_model(s: str) -> str:
+    return MODEL_SYNONYMS.get(s, s)
+
+# =================================
+# ---------- EXTRACTION ----------
+# =================================
+PRICE_RE = re.compile(r"(?:under|below|less than|<=?|<|\$)\s*\$?\s*([0-9]{2,6})", re.I)
+YEAR_RE  = re.compile(r"(?:from|after|since|>=?)\s*(20\d{2}|19\d{2})|(?:year|model year|my)\s*(20\d{2}|19\d{2})|(?:\b(20\d{2}|19\d{2})\b)", re.I)
+MILES_RE = re.compile(r"(?:under|below|less than|<=?|<)\s*([0-9]{2,6})\s*(?:miles?|mi\b)", re.I)
+
+def extract_make_model(text: str, inv: Optional[List[Dict[str, Any]]] = None) -> Tuple[Optional[str], Optional[str]]:
+    """Forgiving extractor from free text."""
+    if not text: return None, None
+    inv = inv or load_inventory()
+    makes = sorted({(r.get("Make") or "").strip().lower() for r in inv if r.get("Make")})
+    models_raw = [(r.get("Model") or "").strip() for r in inv if r.get("Model")]
+    models_norm = sorted({m.lower().replace("-", "").strip() for m in models_raw})
+
+    words = re.findall(r"[A-Za-z0-9\-]+", text.lower())
+    mk = md = None
+    for w in words:
+        wn = _canon_model(w.replace("-", ""))
+        if not md and wn in models_norm: md = wn
+        wm = _canon_make(w)
+        if not mk and wm in makes: mk = wm
+    return mk, md
+
+def extract_price_max(text: str) -> Optional[int]:
+    m = PRICE_RE.search(text or "")
+    try:
+        if m:
+            return int(m.group(1))
+    except Exception:
+        return None
+    return None
+
+def extract_year_min(text: str) -> Optional[int]:
+    for m in YEAR_RE.finditer(text or ""):
+        for g in m.groups():
+            if g and g.isdigit():
+                y = int(g)
+                if 1980 <= y <= 2100:
+                    return y
+    return None
+
+def extract_mileage_max(text: str) -> Optional[int]:
+    m = MILES_RE.search(text or "")
+    try:
+        if m:
+            return int(m.group(1))
+    except Exception:
+        return None
+    return None
+
+def extract_condition(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    for k, v in CONDITION_WORDS.items():
+        if k in t: return v
+    return None
+
+def extract_color(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    for k, v in COLOR_WORDS.items():
+        if re.search(rf"\b{k}\b", t): return v
+    return None
+
+def fill_fields_from_text(s: Dict[str, Any], text: str) -> int:
+    """Try to fill any of the 7 fields from this turn. Returns number of newly filled fields."""
+    inv = load_inventory()
+    before = sum(1 for f in GOAL_FIELDS if s.get(f))
+    mk, md = extract_make_model(text, inv)
+    price_max = extract_price_max(text)
+    year_min = extract_year_min(text)
+    miles = extract_mileage_max(text)
+    cond = extract_condition(text)
+    color = extract_color(text)
+
+    if mk and not s.get("make"): s["make"] = mk
+    if md and not s.get("model"): s["model"] = md
+    if price_max and not s.get("price_max"): s["price_max"] = price_max
+    if year_min and not s.get("year_min"): s["year_min"] = year_min
+    if miles and not s.get("mileage_max"): s["mileage_max"] = miles
+    if cond and not s.get("condition"): s["condition"] = cond
+    if color and not s.get("color"): s["color"] = color
+
+    after = sum(1 for f in GOAL_FIELDS if s.get(f))
+    return max(0, after - before)
+
+# =================================
+# ---------- SEARCH --------------
+# =================================
+def _as_int(x: Any) -> Optional[int]:
+    try:
+        s = str(x).replace(",", "").strip()
+        return int(s) if s.isdigit() else None
+    except Exception:
+        return None
+
+def matches_filters(v: Dict[str, Any], s: Dict[str, Any]) -> Tuple[bool, int]:
+    """Return (match, score). Score rewards matched fields."""
+    score = 0
+    # make/model
+    if s.get("make"):
+        if s["make"] not in (v.get("Make","") or "").lower(): return (False, 0)
+        score += 1
+    if s.get("model"):
+        if s["model"].replace("-", "") not in (v.get("Model","") or "").lower().replace("-", ""): return (False, 0)
+        score += 1
+    # price
+    if s.get("price_max"):
+        price_i = _as_int(v.get("Price"))
+        if price_i is None or price_i > int(s["price_max"]): return (False, 0)
+        score += 1
+    # year
+    if s.get("year_min"):
+        vy = _as_int(v.get("Year"))
+        if vy is None or vy < int(s["year_min"]): return (False, 0)
+        score += 1
+    # mileage
+    if s.get("mileage_max"):
+        miles_i = _as_int(v.get("Mileage"))
+        if miles_i is None or miles_i > int(s["mileage_max"]): return (False, 0)
+        score += 1
+    # condition
+    if s.get("condition"):
+        if (v.get("Condition","") or "").lower() != s["condition"].lower(): return (False, 0)
+        score += 1
+    # color (loose contains)
+    if s.get("color"):
+        if s["color"].lower() not in (v.get("Color","") or "").lower(): return (False, 0)
+        score += 1
+    return (True, score)
+
+def search_inventory(s: Dict[str, Any], limit: int = 3) -> List[Dict[str, Any]]:
+    inv = load_inventory()
+    scored: List[Tuple[int, Dict[str, Any]]] = []
+    for v in inv:
+        ok, sc = matches_filters(v, s)
+        if ok:
+            scored.append((sc, v))
+    # If nothing matches strict filters, relax gradually (drop least important fields)
+    if not scored:
+        relaxed_order = ["color", "condition", "mileage_max", "year_min", "price_max", "model", "make"]
+        tmp = dict(s)
+        for f in relaxed_order:
+            if tmp.get(f):
+                tmp[f] = None
+                scored = []
+                for v in inv:
+                    ok, sc = matches_filters(v, tmp)
+                    if ok:
+                        scored.append((sc, v))
+                if scored:  # stop at first level that yields hits
+                    s["_relaxed"] = f
+                    break
+    scored.sort(key=lambda t: (-t[0], (t[1].get("Price") or "")))
+    return [v for _, v in scored[:limit]]
 
 # =================================
 # ---------- CALENDAR ------------
@@ -356,8 +353,7 @@ def _is_free(start, end, busy):
     for b in busy:
         bs = datetime.fromisoformat(b["start"].replace("Z", "+00:00"))
         be = datetime.fromisoformat(b["end"].replace("Z", "+00:00"))
-        if not (e <= bs or s >= be):
-            return False
+        if not (e <= bs or s >= be): return False
     return True
 
 def _parse_hours():
@@ -371,13 +367,10 @@ def propose_slots(sales_cal_id: Optional[str]) -> List[str]:
     service = _google_service()
     hours = _parse_hours()
     if service and DEALERSHIP_CALENDAR_ID and sales_cal_id:
-        now = datetime.now(tz)
-        horizon = now + timedelta(days=5)
+        now = datetime.now(tz); horizon = now + timedelta(days=5)
         fb = _freebusy(service, [DEALERSHIP_CALENDAR_ID, sales_cal_id], now, horizon, TIMEZONE)
-        dealer_busy = fb.get(DEALERSHIP_CALENDAR_ID, [])
-        sales_busy = fb.get(sales_cal_id, [])
-        slots = []
-        d = now
+        dealer_busy = fb.get(DEALERSHIP_CALENDAR_ID, []); sales_busy = fb.get(sales_cal_id, [])
+        slots = []; d = now
         while d < horizon and len(slots) < 2:
             wd = ["mon","tue","wed","thu","fri","sat","sun"][d.weekday()]
             start_hour, end_hour = (hours.get(wd, [9, 18]) if isinstance(hours.get(wd, []), list) else [9, 18])
@@ -389,8 +382,7 @@ def propose_slots(sales_cal_id: Optional[str]) -> List[str]:
                     slots.append(s.strftime("%A %I:%M %p"))
                     if len(slots) == 2: break
             d = (d + timedelta(days=1)).replace(hour=start_hour, minute=0)
-        if slots:
-            return slots
+        if slots: return slots
     try:
         return json.loads(APPT_DEFAULT_SLOTS_JSON)[:2]
     except Exception:
@@ -432,7 +424,7 @@ def create_calendar_event(sp, customer_email, customer_phone, start_str, title, 
         "summary": title,
         "description": description,
         "start": {"dateTime": start.astimezone(ZoneInfo("UTC")).isoformat(), "timeZone": TIMEZONE},
-        "end":   {"dateTime": end.astimezone(ZoneInfo("UTC")).isoformat(), "timeZone": TIMEZONE},
+        "end":   {"dateTime": end.astimezone(ZoneInfo("UTC")).isoformat(),   "timeZone": TIMEZONE},
         "attendees": [{"email": sp.get("email")}] + ([{"email": customer_email}] if customer_email else []),
     }
     try:
@@ -503,9 +495,10 @@ def extract_contact(text: str) -> Tuple[Optional[str], Optional[str]]:
 # =================================
 INTENTS: Dict[str, List[str]] = {
     "sales_inquiry": [
-        r"\b(test[-\s]?drive|book|appointment)\b",
-        r"\b(look(ing)? for|interested in|inventory|available|in stock|have any|got any)\b",
-        r"\b(suv|sedan|truck|hatchback|coupe|van|minivan|convertible|crossover)\b"
+        r"\b(test[-\s]?drive|book|appointment|schedule)\b",
+        r"\b(look(ing)? for|interested in|inventory|available|in stock|have any|show me)\b",
+        r"\b(civic|accord|camry|corolla|rav[\s-]?4|f[-\s]?150|model\s?[3syx])\b",
+        r"\b(suv|sedan|truck|hatchback|coupe)\b"
     ],
     "service_request": [
         r"\b(service|repair|maintenance|oil change|check engine|brake|tire|diagnostic)\b"
@@ -524,7 +517,7 @@ def classify_intent(text: str) -> str:
         for p in patterns:
             if re.search(p, t):
                 return name
-    return "sales_inquiry"  # default path
+    return "sales_inquiry"
 
 # =================================
 # ---------- API -----------------
@@ -557,7 +550,7 @@ class VoiceTurn(BaseModel):
     transcript: Optional[str] = ""
     caller_phone: Optional[str] = None
 
-# SALESPEOPLE utils
+# --- salespeople utils ---
 def load_salespeople() -> List[Dict[str, Any]]:
     try:
         return [a for a in json.loads(SALESPEOPLE_JSON or "[]") if a.get("name")]
@@ -579,18 +572,8 @@ def pick_salesperson_round_robin() -> Optional[Dict[str, Any]]:
     _round_robin_idx += 1
     return sp
 
-# Booking affirmations
-YES_WORDS = {"yes","yeah","yep","sure","sounds good","ok","okay","let's do it","book","schedule","set it up","come by","come in","test drive"}
-NO_WORDS  = {"no","not now","maybe later","just looking","browsing"}
-def _wants_booking(text: str) -> bool:
-    t = (text or "").lower()
-    return any(w in t for w in YES_WORDS) or "test drive" in t or "see it" in t
-def _declines_booking(text: str) -> bool:
-    t = (text or "").lower()
-    return any(w in t for w in NO_WORDS)
-
 # =================================
-# ---------- VOICE WEBHOOK -------
+# ---------- VOICE FLOW ----------
 # =================================
 @app.post("/webhooks/voice")
 async def webhooks_voice(turn: VoiceTurn):
@@ -598,174 +581,163 @@ async def webhooks_voice(turn: VoiceTurn):
 
     s = get_session(turn.session_id)
     text = (turn.transcript or "").strip()
-    if not s.get("intent"):
+
+    # classify once, but keep sales as default
+    if s.get("intent") is None:
         s["intent"] = classify_intent(text)
 
-    # -------- GREETING / ROUTER --------
+    # ---- GREETING ----
     if s["state"] == "GREETING":
-        intent = s["intent"] or classify_intent(text)
-        if intent == "service_request":
-            s["state"] = "SERVICE_GREETING"
-            post_analytics({"type": "intent", "payload": {"intent": "service_request"}})
-            return {"reply": "Happy to help with service. What vehicle and issue are you experiencing?", "handoff": False, "end_call": False}
-        if intent == "hours_location":
-            s["state"] = "INFO"
-            addr = f" Our address is {DEALERSHIP_ADDRESS}." if DEALERSHIP_ADDRESS else ""
-            return {"reply": f"We’re open most days 9 AM to 6 PM.{addr} Would you like to book a visit?", "handoff": False, "end_call": False}
-        s["state"] = "QUALIFY"
-        return {"reply": f"Thanks for calling {DEALERSHIP_NAME}! Tell me what you’re after—make, model, color, mileage, or budget—and I’ll check availability.", "handoff": False, "end_call": False}
-
-    # -------- SALES FLOW (Flexible & Triggered) --------
-    if s["state"] == "QUALIFY":
-        # If caller mentions anything car-ish, search immediately with combined filters
-        if should_search_now(text):
-            new_filters = parse_filters(text)
-            # remember make/model across turns
-            if new_filters.get("make"):  s["make"]  = new_filters["make"]
-            if new_filters.get("model"): s["model"] = new_filters["model"]
-
-            combined = {
-                "make":   s.get("make")  or new_filters.get("make"),
-                "model":  s.get("model") or new_filters.get("model"),
-                "year":   new_filters.get("year"),
-                "body":   new_filters.get("body"),
-                "color":  new_filters.get("color"),
-                "budget": new_filters.get("budget"),
-                "mileage_max": new_filters.get("mileage_max"),
-            }
-
-            matches = search_inventory(combined)
-            reply = compose_inventory_reply(matches, combined)
-
-            if matches:
-                s["vehicle"] = matches[0]
-                sp = pick_salesperson_by_name(text) or pick_salesperson_round_robin()
-                s["salesperson"] = sp
-                s["proposed"] = propose_slots(sp.get("calendar_id") if sp else None)
-
-                # user already leaning to book?
-                if _wants_booking(text):
-                    s["state"] = "SLOTS"
-                    return {"reply": f"{reply} Let’s set up a quick visit—{', '.join(s['proposed'])} work for you?",
-                            "handoff": False, "end_call": False}
-
-                # otherwise: answer first, then nudge
-                nudge = "Want to pop in for a quick look or test drive?"
-                if s["proposed"]:
-                    nudge = f"Want to pop in for a quick look or test drive? I have {', '.join(s['proposed'])}."
-                return {"reply": f"{reply} {nudge}", "handoff": False, "end_call": False}
-
-            # No matches → offer alternatives and ask for one clarifier
-            inv = load_inventory()
-            models_norm = sorted({(r.get("Model") or "").strip().lower().replace("-", "") for r in inv if r.get("Model")})
-            wanted = (combined.get("model") or "") or (combined.get("body") or "")
-            alts = difflib.get_close_matches(wanted, models_norm, n=2, cutoff=0.6) if wanted else []
-            alt_text = f" Maybe {', '.join(alts)}?" if alts else ""
-            return {"reply": f"{reply}{alt_text} Share one must-have—model, color, year, budget, or mileage—and I’ll refine it.",
-                    "handoff": False, "end_call": False}
-
-        # If nothing to search yet, give helpful examples once (not spammy)
-        inv = load_inventory()
-        seen_models, top_models = set(), []
-        for r in inv:
-            md = (r.get("Model") or "").strip()
-            if md and md.lower() not in seen_models:
-                seen_models.add(md.lower()); top_models.append(md)
-            if len(top_models) == 3: break
-        return {"reply": f"Got it. Tell me something like ‘red SUV under 25k’, ‘Civic under 40k miles’, or a model like {', '.join(top_models)}.",
+        s["state"] = "COLLECT"
+        return {"reply": f"Thanks for calling {DEALERSHIP_NAME}! Tell me what you have in mind—make, model, budget, year, mileage, condition or even color, and I’ll find the best matches.",
                 "handoff": False, "end_call": False}
 
-    # -------- SLOT SELECTION --------
-    if s["state"] == "SLOTS":
-        if _wants_booking(text) and not s.get("proposed"):
-            sp = s.get("salesperson") or pick_salesperson_round_robin()
+    # ---- PRESENT (already showed options) ----
+    if s["state"] == "PRESENT":
+        # If they say "first/second" or name one, jump to slots
+        choice = None
+        if re.search(r"\bfirst\b", text.lower()):
+            choice = 0
+        elif re.search(r"\bsecond\b", text.lower()):
+            choice = 1
+        elif re.search(r"\bthird\b", text.lower()):
+            choice = 2
+        else:
+            # try model+year match
+            for i, v in enumerate(s.get("vehicle_hits") or []):
+                m = (v.get("Model","") or "").lower()
+                y = str(v.get("Year","") or "")
+                if m and m in text.lower() or (y and y in text):
+                    choice = i; break
+
+        if choice is not None and (s.get("vehicle_hits") and 0 <= choice < len(s["vehicle_hits"])):
+            chosen_v = s["vehicle_hits"][choice]
+            s["chosen_vehicle"] = chosen_v
+            sp = pick_salesperson_by_name(text) or pick_salesperson_round_robin()
             s["salesperson"] = sp
             s["proposed"] = propose_slots(sp.get("calendar_id") if sp else None)
+            s["state"] = "SLOTS"
+            return {"reply": f"Great choice — {vehicle_blurb(chosen_v)}. I can set up a quick test drive. Times: {', '.join(s['proposed'])}. What works for you?",
+                    "handoff": False, "end_call": False}
 
-        chosen = None
-        for sl in (s.get("proposed") or []):
-            if sl and sl.lower() in text.lower():
-                chosen = sl; break
-        if not chosen:
-            if re.search(r"\bfirst\b", text.lower()) and s.get("proposed"):
-                chosen = s["proposed"][0]
-            elif re.search(r"\bsecond\b", text.lower()) and s.get("proposed") and len(s["proposed"]) > 1:
-                chosen = s["proposed"][1]
-        if not chosen:
-            if _declines_booking(text):
-                s["state"] = "QUALIFY"
-                return {"reply": "No problem. What else can I look up—another model, color, budget, or mileage?",
+        # Otherwise keep collecting (maybe they added more filters)
+        s["state"] = "COLLECT"
+
+    # ---- COLLECT (natural filling of fields) ----
+    if s["state"] == "COLLECT":
+        new_count = fill_fields_from_text(s, text)
+        if new_count > 0:
+            s["no_new_field_turns"] = 0
+        else:
+            s["no_new_field_turns"] += 1
+
+        filled = [f for f in GOAL_FIELDS if s.get(f)]
+        # trigger search if enough signals OR user explicitly asked
+        enough = len(filled) >= 4 or re.search(r"\b(show|any|have|available|inventory|do you have)\b", text.lower())
+
+        if enough:
+            hits = search_inventory(s, limit=3)
+            s["vehicle_hits"] = hits
+            if hits:
+                s["state"] = "PRESENT"
+                top = "; ".join(vehicle_blurb(v) for v in hits)
+                extra = ""
+                if s.get("_relaxed"):
+                    extra = f" (I relaxed '{s['_relaxed']}' to show options)."
+                return {"reply": f"Here are some good matches{extra}: {top}. Which one should I set up a test drive for—first, second, or third?",
                         "handoff": False, "end_call": False}
-            return {"reply": f"Which time works best: {', '.join(s.get('proposed') or [])}?",
+            else:
+                # no hits yet—suggest a gentle narrowing
+                s["state"] = "COLLECT"
+                return {"reply": "I didn’t see anything with those exact filters. Want to adjust the budget, year, or color a bit and I’ll re-check?",
+                        "handoff": False, "end_call": False}
+
+        # If not enough yet and we’ve had 2 turns with no new info, ask the next missing field
+        if s["no_new_field_turns"] >= 2:
+            for f in GOAL_FIELDS:
+                if not s.get(f):
+                    s["no_new_field_turns"] = 0
+                    prompts = {
+                        "make": "Do you have a make in mind—like Honda, Toyota, or Chevy?",
+                        "model": "Any model you’re leaning toward—Civic, Camry, Accord?",
+                        "price_max": "What’s a comfortable budget to stay under?",
+                        "year_min": "Is there a model year you’d prefer—from what year and newer?",
+                        "mileage_max": "Any mileage cap you want to stay under?",
+                        "condition": "New, used, or certified?",
+                        "color": "Any color preferences?"
+                    }
+                    return {"reply": prompts[f], "handoff": False, "end_call": False}
+
+        # Otherwise, acknowledge and keep listening—no forced question
+        ack_bits = []
+        for key, label in [("make","make"),("model","model"),("price_max","budget"),
+                           ("year_min","year"),("mileage_max","mileage"),("condition","condition"),("color","color")]:
+            if s.get(key): ack_bits.append(label)
+        if ack_bits:
+            return {"reply": f"Got it on {', '.join(ack_bits)}. Anything else you want me to factor in—like year, mileage, condition or color?",
+                    "handoff": False, "end_call": False}
+        else:
+            return {"reply": "Tell me anything you care about—make, model, price, year, mileage, condition or color—and I’ll pull matches.",
+                    "handoff": False, "end_call": False}
+
+    # ---- SLOTS ----
+    if s["state"] == "SLOTS":
+        chosen = None
+        txt = text.lower()
+        # allow “morning/afternoon” mapping
+        if "morning" in txt and s["proposed"]: chosen = s["proposed"][0]
+        if "afternoon" in txt and len(s["proposed"]) > 1: chosen = s["proposed"][1]
+        # ordinal shortcuts
+        if re.search(r"\bfirst\b", txt) and s["proposed"]: chosen = s["proposed"][0]
+        if re.search(r"\bsecond\b", txt) and len(s["proposed"])>1: chosen = s["proposed"][1]
+        # exact include
+        for sl in s["proposed"]:
+            if sl.lower() in txt: chosen = sl; break
+
+        if not chosen:
+            return {"reply": f"Which time works best: {', '.join(s['proposed'])}?",
                     "handoff": False, "end_call": False}
 
         s["chosen"] = chosen
         s["state"] = "CONTACT"
-        return {"reply": "Great—what’s the best phone number and email for confirmation?",
+        return {"reply": "Perfect. What’s the best phone number and email for confirmation?",
                 "handoff": False, "end_call": False}
 
-    # -------- CONTACT / CONFIRM --------
+    # ---- CONTACT ----
     if s["state"] == "CONTACT":
         ph, em = extract_contact(text)
-        if turn.caller_phone and not s["phone"]: s["phone"] = turn.caller_phone
+        if turn.caller_phone and not s.get("phone"): s["phone"] = turn.caller_phone
         if ph: s["phone"] = ph
         if em: s["email"] = em
-        if not (s.get("phone") and s.get("email")):
-            return {"reply": "I’ll need both a phone number and an email to confirm. Can you share both?",
+
+        if not (s.get("phone") or s.get("email")):
+            return {"reply": "I’ll need a phone or an email to send the confirmation—whichever you prefer.",
                     "handoff": False, "end_call": False}
 
         sp = s.get("salesperson") or {}
-        v  = s.get("vehicle") or {}
+        v  = s.get("chosen_vehicle") or (s.get("vehicle_hits")[0] if s.get("vehicle_hits") else {})
         slot = s.get("chosen") or ""
-        title = f"Showroom Appointment — {vehicle_blurb(v)}"
+        title = f"Showroom Appointment — {vehicle_blurb(v)}" if v else "Showroom Appointment"
         desc = (
-            f"Customer: {s.get('email')} / {s.get('phone')}\n"
+            f"Customer: {s.get('email','')} / {s.get('phone','')}\n"
             f"Salesperson: {sp.get('name','')} <{sp.get('email','')}>\n"
             f"Vehicle: {json.dumps(v, ensure_ascii=False)}\n"
             f"Booked via {DEALERSHIP_NAME} AI receptionist."
         )
         link = create_calendar_event(sp, s.get("email"), s.get("phone"), slot, title, desc)
 
-        msg = f"{DEALERSHIP_NAME}: Confirmed {slot} with {sp.get('name','our advisor')} — {vehicle_blurb(v)}."
-        send_sms(s.get("phone"), msg)
-        send_email(s.get("email"), f"{DEALERSHIP_NAME} appointment confirmed", msg + (f"\nCalendar: {link}" if link else ""))
+        msg = f"{DEALERSHIP_NAME}: Confirmed {slot} — {vehicle_blurb(v)}." if v else f"{DEALERSHIP_NAME}: Confirmed {slot}."
+        if s.get("phone"): send_sms(s["phone"], msg)
+        if s.get("email"): send_email(s["email"], f"{DEALERSHIP_NAME} appointment confirmed", msg + (f"\nCalendar: {link}" if link else ""))
 
-        outcome = {
-            "slot": slot,
-            "vehicle": v,
-            "salesperson": sp,
-            "phone": s.get("phone"),
-            "email": s.get("email"),
-            "calendar_link": link
-        }
+        outcome = {"slot": slot, "vehicle": v, "salesperson": sp, "phone": s.get("phone"), "email": s.get("email"), "calendar_link": link}
         print("[BOOKED]", json.dumps(outcome, ensure_ascii=False))
         post_analytics({"type": "booking", "payload": outcome})
 
         s["state"] = "CLOSE"
-        return {"reply": "Booked! I’ll send your confirmation shortly. Anything else I can help with?",
+        return {"reply": "Booked! I’ll send your confirmation. Anything else I can help with?",
                 "handoff": False, "end_call": False}
 
-    # -------- SERVICE (MVP) --------
-    if s["state"] == "SERVICE_GREETING":
-        if "issue" not in s or not s.get("issue"):
-            s["issue"] = text
-            return {"reply": "Thanks. I’ll get a service advisor to follow up. What’s the best phone and email?", "handoff": False, "end_call": False}
-        ph, em = extract_contact(text)
-        if turn.caller_phone and not s.get("phone"): s["phone"] = turn.caller_phone
-        if ph: s["phone"] = ph
-        if em: s["email"] = em
-        if not (s.get("phone") and s.get("email")):
-            return {"reply": "I’ll need both a phone number and an email for the service advisor to contact you.",
-                    "handoff": False, "end_call": False}
-        post_analytics({"type": "service_lead", "payload": {"issue": s.get("issue"), "phone": s.get("phone"), "email": s.get("email")}})
-        s["state"] = "CLOSE"
-        return {"reply": "Thanks! Our service team will reach out shortly. Anything else I can help with?",
-                "handoff": False, "end_call": False}
-
-    # -------- INFO / SMALLTALK --------
-    if s["state"] == "INFO":
-        s["state"] = "GREETING"
-        return {"reply": "Anything else I can help with today—sales or service?", "handoff": False, "end_call": False}
-
-    # default fall-through / end
-    return {"reply": "Thanks for calling. Have a great day!", "handoff": False, "end_call": True}
+    # ---- FALLTHROUGH / CLOSE ----
+    return {"reply": "Thanks for calling. Have a great day!",
+            "handoff": False, "end_call": True}
